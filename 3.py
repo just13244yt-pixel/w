@@ -228,37 +228,66 @@ class PiFileManager:
             self.msg(f"Fehler: {e}", True)
 
     def usb_copy(self, path):
-        # Find USB drives via lsblk
+        # Find USB drives via lsblk - more robust for Raspberry Pi Lite
         try:
-            output = subprocess.check_output(['lsblk', '-nr', '-o', 'MOUNTPOINT']).decode()
-            mounts = [line.strip() for line in output.split('\n') if line.strip() and line.startswith(('/media', '/mnt'))]
+            # Get device name, size, and mountpoint
+            output = subprocess.check_output(['lsblk', '-nr', '-o', 'NAME,SIZE,MOUNTPOINT,TRAN']).decode()
+            devices = []
+            for line in output.split('\n'):
+                parts = line.split()
+                if len(parts) >= 2 and 'usb' in line.lower():
+                    name = parts[0]
+                    size = parts[1]
+                    mount = parts[2] if len(parts) > 2 and parts[2].startswith('/') else None
+                    devices.append({'dev': f"/dev/{name}", 'size': size, 'mount': mount})
         except:
-            mounts = []
+            devices = []
             
-        if not mounts:
-            self.msg("Kein USB-Stick gefunden!", True)
+        if not devices:
+            self.msg("Kein USB-Gerät gefunden!", True)
             return
 
         sel = 0
         while True:
             self.stdscr.clear()
-            self.stdscr.addstr(0, 0, " WÄHLE USB-STICK: ", curses.color_pair(3))
-            for i, m in enumerate(mounts):
+            self.stdscr.addstr(0, 0, " WÄHLE USB-GERÄT: ", curses.color_pair(3))
+            for i, d in enumerate(devices):
+                status = f"[{d['mount']}]" if d['mount'] else "[Nicht eingebunden]"
                 if i == sel: self.stdscr.attron(curses.color_pair(3))
-                self.stdscr.addstr(i+2, 2, f" {m} ")
+                self.stdscr.addstr(i+2, 2, f" {d['dev']} ({d['size']}) {status} ")
                 if i == sel: self.stdscr.attroff(curses.color_pair(3))
             self.stdscr.refresh()
             k = self.stdscr.getch()
             if k == curses.KEY_UP: sel = max(0, sel - 1)
-            elif k == curses.KEY_DOWN: sel = min(len(mounts)-1, sel + 1)
+            elif k == curses.KEY_DOWN: sel = min(len(devices)-1, sel + 1)
             elif k == ord('\n'):
-                dest = os.path.join(mounts[sel], os.path.basename(path))
+                target = devices[sel]
+                mount_path = target['mount']
+                
+                # Try to mount if not mounted
+                if not mount_path:
+                    mount_path = f"/mnt/usb_{os.path.basename(target['dev'])}"
+                    try:
+                        if not os.path.exists(mount_path):
+                            subprocess.run(['sudo', 'mkdir', '-p', mount_path])
+                        res = subprocess.run(['sudo', 'mount', target['dev'], mount_path], capture_output=True)
+                        if res.returncode != 0:
+                            # Try with common partition if it's a disk
+                            res = subprocess.run(['sudo', 'mount', f"{target['dev']}1", mount_path], capture_output=True)
+                            if res.returncode != 0:
+                                raise Exception("Mount fehlgeschlagen. Partition 1 probiert.")
+                    except Exception as e:
+                        self.msg(f"Mount-Fehler: {e}", True)
+                        return
+
+                dest = os.path.join(mount_path, os.path.basename(path))
                 try:
+                    self.msg("Kopiere... bitte warten.")
                     if os.path.isdir(path): shutil.copytree(path, dest)
                     else: shutil.copy2(path, dest)
-                    self.msg("Auf USB kopiert!")
+                    self.msg("Erfolgreich kopiert!")
                 except Exception as e:
-                    self.msg(f"Fehler: {e}", True)
+                    self.msg(f"Kopier-Fehler: {e}", True)
                 return
             elif k == 27: break
 
