@@ -320,7 +320,7 @@ def deauth_handshake(mon_interface, selected):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
             except Exception as e:
                 log(f"Fehler in Deauth-Burst: {e}")
-            time.sleep(5)
+            time.sleep(15)  # Geändert auf 15 Sekunden für gezielte Verbindungsabbrüche
     
     t = threading.Thread(target=deauth_loop, daemon=True)
     t.start()
